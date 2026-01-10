@@ -35,11 +35,19 @@ func (r *Resolver) LookupAddr(ctx context.Context, addr string) ([]string, error
 
 // lookup implements the common caching and singleflight logic
 func (r *Resolver) lookup(ctx context.Context, key string, doFetch func(context.Context, string) ([]string, error)) ([]string, error) {
-	values, expireAt := r.cache.Get(key)
-	if values != nil {
+	values, cachedErr, expireAt := r.cache.Get(key)
+	if !expireAt.IsZero() {
 		if time.Now().Before(expireAt) {
 			// Cache hit and not expired
 			atomic.AddUint64(&r.stats.CacheHits, 1)
+
+			if cachedErr != nil {
+				if r.config.PersistOnFailure && len(values) > 0 {
+					return values, nil
+				}
+				return nil, cachedErr
+			}
+
 			if r.config.EnableAutoRefresh {
 				ttl := r.config.CacheTTL
 				if ttl > 0 && time.Until(expireAt) < ttl/2 {
@@ -62,8 +70,14 @@ func (r *Resolver) lookup(ctx context.Context, key string, doFetch func(context.
 	// Cache misses check
 	v, err, shared := r.lookupGroup.Do(key, func() (interface{}, error) {
 		// Double check cache inside singleflight
-		if values, expireAt := r.cache.Get(key); values != nil {
+		if values, cachedErr, expireAt := r.cache.Get(key); !expireAt.IsZero() {
 			if time.Now().Before(expireAt) {
+				if cachedErr != nil {
+					if r.config.PersistOnFailure && len(values) > 0 {
+						return values, nil
+					}
+					return nil, cachedErr
+				}
 				return values, nil
 			}
 		}
@@ -74,7 +88,7 @@ func (r *Resolver) lookup(ctx context.Context, key string, doFetch func(context.
 		// If the error is context cancelled/timeout, we should not cache it (implicitly handled by not setting cache on error)
 		// But we should also consider if we want to return stale data if available.
 		if r.config.PersistOnFailure {
-			if values, _ := r.cache.Get(key); values != nil {
+			if values, _, _ := r.cache.Get(key); values != nil {
 				return values, nil
 			}
 		}
@@ -143,6 +157,13 @@ func (r *Resolver) lookupAndCache(ctx context.Context, key string, fetcher func(
 	}
 
 	if err != nil {
+		if ctx.Err() == nil {
+			var existingIPs []string
+			if r.config.PersistOnFailure {
+				existingIPs, _, _ = r.cache.Get(key)
+			}
+			r.cache.Set(key, existingIPs, err, r.config.CacheFailTTL)
+		}
 		return nil, err
 	}
 
@@ -155,13 +176,13 @@ func (r *Resolver) lookupAndCache(ctx context.Context, key string, fetcher func(
 	}
 
 	if r.config.OnChange != nil {
-		oldIPs, _ := r.cache.Get(key)
+		oldIPs, _, _ := r.cache.Get(key)
 		if oldIPs == nil || ipListChanged(oldIPs, results) {
 			go r.config.OnChange(key, results)
 		}
 	}
 
-	r.cache.Set(key, results, r.config.CacheTTL)
+	r.cache.Set(key, results, nil, r.config.CacheTTL)
 	return results, nil
 }
 

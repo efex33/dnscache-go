@@ -9,6 +9,7 @@ It is designed to eliminate DNS latency spikes and provide robust connection han
 While heavily inspired by existing solutions like `rs/dnscache`, this library introduces several key engineering improvements for production environments:
 
 - **Smart Async Refresh**: Unlike traditional caches that expire and block, this library automatically refreshes "hot" domains in the background when their TTL is halfway through. This ensures your application **always hits the cache (0ms latency)** and never waits for DNS resolution during high traffic.
+- **Negative Caching**: Automatically caches DNS failures for a short duration (default 1 second). This prevents "cache stampede" on the upstream DNS server during outages while ensuring rapid recovery when the service is restored.
 - **Standard `DialContext` with Failover**: Directly implements the standard `DialContext` interface, making it a true drop-in replacement for `http.Transport`. It also includes built-in connection failover (Happy Eyeballs simplified), automatically retrying the next IP if the first one fails.
 - **Configurable TTL**: Supports explicit Cache TTL configuration. Entries expire deterministically, and a background cleaner (optional) ensures unused entries are removed, preventing memory leaks without relying on manual refresh triggers.
 - **Proper Context Handling**: Fully respects Go's `context` propagation, including cancellation and deadlines, without breaking the call chain.
@@ -20,6 +21,7 @@ While heavily inspired by existing solutions like `rs/dnscache`, this library in
 - **Zero Latency**: Async auto-refresh keeps the cache warm for active domains.
 - **High Availability**: Connection failover ensures robustness against single IP failures.
 - **Observability**: Built-in metrics (`CacheHits`/`CacheMisses`), `OnCacheMiss` hook, and `httptrace` support.
+- **Dynamic Updates**: `OnChange` hook allows reacting to IP changes in real-time (e.g., for service discovery).
 - **Trace Support**: Respects `httptrace.ClientTrace` context for detailed performance analysis.
 - **Zero Config**: Works out of the box with sensible defaults.
 
@@ -90,6 +92,18 @@ ips, err := resolver.LookupHost(context.Background(), "example.com")
 // ips: ["93.184.216.34", ...]
 ```
 
+## IP Change Notifications
+
+You can register a callback to be notified whenever the resolved IP addresses for a host change. This is particularly useful for updating downstream systems (like load balancers) in real-time.
+
+```go
+config := dnscache.Config{
+    OnChange: func(host string, ips []string) {
+        fmt.Printf("IPs changed for %s: %v\n", host, ips)
+    },
+}
+```
+
 ## Observability & Metrics
 
 ### Cache Statistics
@@ -132,11 +146,25 @@ config := dnscache.Config{
     // Customize cache expiration (default: 1 minute)
     CacheTTL: 5 * time.Minute,
 
+    // Customize expiration for failed lookups (Negative Caching).
+    // Default is 1 second to prevent immediate retries (thundering herd)
+    // while ensuring quick recovery.
+    CacheFailTTL: 1 * time.Second,
+
+    // OnChange is executed when the resolved IPs for a host change.
+    // It receives the host name and the new list of IP addresses.
+    // This is useful for load balancer updates or service discovery triggers.
+    OnChange: func(host string, ips []string) {
+        fmt.Printf("IPs changed for %s: %v\n", host, ips)
+    },
+
     // Automatically cleanup unused entries in the background
     // If set to 0 (default), no background cleanup runs.
     CleanupInterval: 10 * time.Minute,
 
-    // Return stale cache data if upstream DNS fails
+    // Return stale cache data if upstream DNS fails.
+    // If true, we will return expired IP records instead of the recent error
+    // (until CacheFailTTL expires).
     PersistOnFailure: true,
 
     // If true, the cache acts as a transparent pass-through proxy.

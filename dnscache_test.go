@@ -48,7 +48,7 @@ func TestIntegration(t *testing.T) {
 		t.Fatal("Expected memoryCache implementation")
 	}
 
-	ips, _ := memCache.Get("example.com")
+	ips, _, _ := memCache.Get("example.com")
 	if len(ips) == 0 {
 		t.Errorf("Expected cache to be populated for example.com")
 	} else {
@@ -146,7 +146,7 @@ func TestLookupAddr(t *testing.T) {
 		t.Fatal("Expected memoryCache implementation")
 	}
 
-	cachedNames, _ := memCache.Get("8.8.8.8")
+	cachedNames, _, _ := memCache.Get("8.8.8.8")
 	if len(cachedNames) == 0 {
 		t.Error("Expected cache to be populated for 8.8.8.8")
 	}
@@ -157,25 +157,25 @@ func TestCacheCleanup(t *testing.T) {
 	cache := r.cache
 
 	// Add two entries
-	cache.Set("keep.me", []string{"1.2.3.4"}, time.Minute)
-	cache.Set("delete.me", []string{"5.6.7.8"}, time.Minute)
+	cache.Set("keep.me", []string{"1.2.3.4"}, nil, time.Minute)
+	cache.Set("delete.me", []string{"5.6.7.8"}, nil, time.Minute)
 
 	// First Prune: resets 'used' flags to false (nothing deleted because they were fresh/used)
 	r.Refresh(true)
 
 	// Access "keep.me" -> marks it used again
-	_, _ = cache.Get("keep.me")
+	_, _, _ = cache.Get("keep.me")
 
 	// Second Prune: should delete "delete.me" (unused since last prune)
 	r.Refresh(true)
 
 	// Verify "keep.me" exists
-	if ips, _ := cache.Get("keep.me"); ips == nil {
+	if ips, _, _ := cache.Get("keep.me"); ips == nil {
 		t.Error("Expected 'keep.me' to remain in cache")
 	}
 
 	// Verify "delete.me" is gone
-	if ips, _ := cache.Get("delete.me"); ips != nil {
+	if ips, _, _ := cache.Get("delete.me"); ips != nil {
 		t.Error("Expected 'delete.me' to be removed from cache")
 	}
 }
@@ -189,7 +189,7 @@ func TestPersistOnFailure(t *testing.T) {
 
 	// Manually inject an expired entry for a non-existent domain
 	key := "nonexistent.test.local"
-	cache.Set(key, []string{"127.0.0.2"}, -time.Second) // Expired 1 second ago
+	cache.Set(key, []string{"127.0.0.2"}, nil, -time.Second) // Expired 1 second ago
 
 	// LookupHost should try to resolve, fail (because domain doesn't exist),
 	// but then fallback to the cached value because PersistOnFailure is true.
@@ -223,7 +223,7 @@ func TestAutoCleanup(t *testing.T) {
 	defer r.Stop()
 
 	cache := r.cache
-	cache.Set("delete.me", []string{"1.2.3.4"}, time.Minute)
+	cache.Set("delete.me", []string{"1.2.3.4"}, nil, time.Minute)
 
 	// Wait for one cycle (resets used flag)
 	time.Sleep(100 * time.Millisecond)
@@ -231,7 +231,7 @@ func TestAutoCleanup(t *testing.T) {
 	// Wait for second cycle (deletes unused)
 	time.Sleep(100 * time.Millisecond)
 
-	if ips, _ := cache.Get("delete.me"); ips != nil {
+	if ips, _, _ := cache.Get("delete.me"); ips != nil {
 		t.Error("Expected 'delete.me' to be auto-removed from cache")
 	}
 }
@@ -297,6 +297,53 @@ func TestStopIdempotency(t *testing.T) {
 	r.Stop()
 	r.Stop()
 	r.Stop()
+}
+
+// TestNegativeCaching verifies that failed lookups are cached for CacheFailTTL
+func TestNegativeCaching(t *testing.T) {
+	var lookupCount int32
+	r := New(Config{
+		CacheFailTTL: 50 * time.Millisecond,
+	})
+
+	// Mock upstream that always fails
+	mock := &mockDNSResolver{
+		lookupHostFunc: func(ctx context.Context, host string) ([]string, error) {
+			atomic.AddInt32(&lookupCount, 1)
+			return nil, fmt.Errorf("upstream failure")
+		},
+	}
+	r.upstream = mock
+
+	// 1. First lookup: should fail and increment count
+	_, err := r.LookupHost(context.Background(), "fail.com")
+	if err == nil {
+		t.Fatal("Expected error, got nil")
+	}
+	if atomic.LoadInt32(&lookupCount) != 1 {
+		t.Errorf("Expected 1 lookup, got %d", atomic.LoadInt32(&lookupCount))
+	}
+
+	// 2. Second lookup immediately: should use cached error (count stays 1)
+	_, err = r.LookupHost(context.Background(), "fail.com")
+	if err == nil {
+		t.Fatal("Expected error, got nil")
+	}
+	if atomic.LoadInt32(&lookupCount) != 1 {
+		t.Errorf("Expected lookup count to remain 1 (cached error), got %d", atomic.LoadInt32(&lookupCount))
+	}
+
+	// 3. Wait for expiry
+	time.Sleep(100 * time.Millisecond)
+
+	// 4. Third lookup: should trigger new lookup
+	_, err = r.LookupHost(context.Background(), "fail.com")
+	if err == nil {
+		t.Fatal("Expected error, got nil")
+	}
+	if atomic.LoadInt32(&lookupCount) != 2 {
+		t.Errorf("Expected lookup count to increase to 2, got %d", atomic.LoadInt32(&lookupCount))
+	}
 }
 
 // Mock resolver for testing OnChange

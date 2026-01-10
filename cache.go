@@ -9,10 +9,10 @@ import (
 type Cache interface {
 	// Get returns the IP addresses for the given key and its expiration time.
 	// If the key is not found, it returns nil and a zero time.
-	Get(key string) ([]string, time.Time)
+	Get(key string) ([]string, error, time.Time)
 
 	// Set sets the IP addresses for the given key with a TTL.
-	Set(key string, ips []string, ttl time.Duration)
+	Set(key string, ips []string, err error, ttl time.Duration)
 
 	// Prune removes entries that haven't been used since the last Prune call.
 	// It returns the number of removed entries.
@@ -21,6 +21,7 @@ type Cache interface {
 
 type cacheItem struct {
 	ips      []string
+	err      error
 	expireAt time.Time
 	used     bool
 }
@@ -36,14 +37,15 @@ func newMemoryCache() *memoryCache {
 	}
 }
 
-func (c *memoryCache) Get(key string) ([]string, time.Time) {
+func (c *memoryCache) Get(key string) ([]string, error, time.Time) {
 	c.mu.RLock()
 	item, ok := c.store[key]
 	if !ok {
 		c.mu.RUnlock()
-		return nil, time.Time{}
+		return nil, nil, time.Time{}
 	}
 	ips := item.ips
+	err := item.err
 	expireAt := item.expireAt
 	used := item.used
 	c.mu.RUnlock()
@@ -56,14 +58,15 @@ func (c *memoryCache) Get(key string) ([]string, time.Time) {
 		c.mu.Unlock()
 	}
 
-	return ips, expireAt
+	return ips, err, expireAt
 }
 
-func (c *memoryCache) Set(key string, ips []string, ttl time.Duration) {
+func (c *memoryCache) Set(key string, ips []string, err error, ttl time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.store[key] = &cacheItem{
 		ips:      ips,
+		err:      err,
 		expireAt: time.Now().Add(ttl),
 		used:     true,
 	}

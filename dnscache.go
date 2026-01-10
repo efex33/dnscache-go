@@ -29,6 +29,10 @@ type Config struct {
 	// Default is 1 minute if not specified.
 	CacheTTL time.Duration
 
+	// CacheFailTTL is the duration for which failed DNS lookups are cached.
+	// Default is 1 second.
+	CacheFailTTL time.Duration
+
 	// EnableAutoRefresh controls whether to automatically refresh cached entries
 	// in the background when they are close to expiring.
 	EnableAutoRefresh bool
@@ -79,6 +83,9 @@ func (r *Resolver) Stats() ResolverStats {
 func New(config Config) *Resolver {
 	if config.CacheTTL == 0 {
 		config.CacheTTL = time.Minute
+	}
+	if config.CacheFailTTL == 0 {
+		config.CacheFailTTL = 1 * time.Second
 	}
 	r := &Resolver{
 		upstream: net.DefaultResolver,
