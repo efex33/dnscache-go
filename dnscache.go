@@ -21,6 +21,10 @@ type Config struct {
 	// and a query is sent to the upstream resolver.
 	OnCacheMiss func(host string)
 
+	// OnChange is executed when the resolved IPs for a host change.
+	// It receives the host name and the new list of IP addresses.
+	OnChange func(host string, ips []string)
+
 	// CacheTTL is the duration for which the DNS records are cached.
 	// Default is 1 minute if not specified.
 	CacheTTL time.Duration

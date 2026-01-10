@@ -298,3 +298,104 @@ func TestStopIdempotency(t *testing.T) {
 	r.Stop()
 	r.Stop()
 }
+
+// Mock resolver for testing OnChange
+type mockDNSResolver struct {
+	lookupHostFunc func(ctx context.Context, host string) ([]string, error)
+}
+
+func (m *mockDNSResolver) LookupHost(ctx context.Context, host string) ([]string, error) {
+	if m.lookupHostFunc != nil {
+		return m.lookupHostFunc(ctx, host)
+	}
+	return nil, nil
+}
+func (m *mockDNSResolver) LookupAddr(ctx context.Context, addr string) ([]string, error) {
+	return nil, nil
+}
+func (m *mockDNSResolver) LookupIP(ctx context.Context, network, host string) ([]net.IP, error) {
+	return nil, nil
+}
+
+func TestOnChange(t *testing.T) {
+	var changes int32
+	var lastIPs []string
+	var mu sync.Mutex
+
+	r := New(Config{
+		CacheTTL: 10 * time.Millisecond, // Short TTL
+		OnChange: func(host string, ips []string) {
+			atomic.AddInt32(&changes, 1)
+			mu.Lock()
+			lastIPs = ips
+			mu.Unlock()
+		},
+	})
+
+	// Mock upstream
+	ipsToReturn := []string{"1.1.1.1"}
+	mock := &mockDNSResolver{
+		lookupHostFunc: func(ctx context.Context, host string) ([]string, error) {
+			return ipsToReturn, nil
+		},
+	}
+	r.upstream = mock
+
+	// 1. First lookup (initial cache population) -> Should trigger OnChange
+	_, err := r.LookupHost(context.Background(), "example.com")
+	if err != nil {
+		t.Fatalf("First lookup failed: %v", err)
+	}
+
+	// Wait for goroutine
+	time.Sleep(50 * time.Millisecond)
+	if atomic.LoadInt32(&changes) != 1 {
+		t.Errorf("Expected 1 change (init), got %d", atomic.LoadInt32(&changes))
+	}
+
+	// 2. Lookup again after TTL expired, but IPs are same -> Should NOT trigger OnChange
+	// Wait for TTL expire
+	time.Sleep(20 * time.Millisecond)
+	_, err = r.LookupHost(context.Background(), "example.com")
+	if err != nil {
+		t.Fatalf("Second lookup failed: %v", err)
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	if atomic.LoadInt32(&changes) != 1 {
+		t.Errorf("Expected changes to stay 1, got %d", atomic.LoadInt32(&changes))
+	}
+
+	// 3. Change upstream IPs -> Should trigger OnChange
+	ipsToReturn = []string{"2.2.2.2", "3.3.3.3"}
+	// Wait for TTL
+	time.Sleep(20 * time.Millisecond)
+	_, err = r.LookupHost(context.Background(), "example.com")
+	if err != nil {
+		t.Fatalf("Third lookup failed: %v", err)
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	if atomic.LoadInt32(&changes) != 2 {
+		t.Errorf("Expected 2 changes, got %d", atomic.LoadInt32(&changes))
+	}
+
+	mu.Lock()
+	if len(lastIPs) != 2 {
+		t.Errorf("Expected lastIPs to have 2 elements, got %v", lastIPs)
+	}
+	mu.Unlock()
+
+	// 4. Change order -> Should NOT trigger OnChange
+	ipsToReturn = []string{"3.3.3.3", "2.2.2.2"}
+	time.Sleep(20 * time.Millisecond)
+	_, err = r.LookupHost(context.Background(), "example.com")
+	if err != nil {
+		t.Fatalf("Fourth lookup failed: %v", err)
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	if atomic.LoadInt32(&changes) != 2 {
+		t.Errorf("Expected changes to stay 2 (order change), got %d", atomic.LoadInt32(&changes))
+	}
+}

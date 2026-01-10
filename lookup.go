@@ -97,6 +97,27 @@ func (r *Resolver) lookup(ctx context.Context, key string, doFetch func(context.
 	return nil, fmt.Errorf("unexpected type from singleflight: %T", v)
 }
 
+// ipListChanged checks if the IP list has changed, ignoring order.
+func ipListChanged(oldIPs, newIPs []string) bool {
+	if len(oldIPs) != len(newIPs) {
+		return true
+	}
+	diff := make(map[string]int, len(oldIPs))
+	for _, x := range oldIPs {
+		diff[x]++
+	}
+	for _, y := range newIPs {
+		if _, ok := diff[y]; !ok {
+			return true
+		}
+		diff[y]--
+		if diff[y] == 0 {
+			delete(diff, y)
+		}
+	}
+	return len(diff) != 0
+}
+
 // lookupAndCache performs the actual upstream lookup and updates the cache.
 // It matches the signature expected by lookup's doFetch but also handles the specific
 // upstream call (LookupHost vs LookupAddr) via the fetcher parameter.
@@ -131,6 +152,13 @@ func (r *Resolver) lookupAndCache(ctx context.Context, key string, fetcher func(
 	// But just to be safe and explicit:
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
+	}
+
+	if r.config.OnChange != nil {
+		oldIPs, _ := r.cache.Get(key)
+		if oldIPs == nil || ipListChanged(oldIPs, results) {
+			go r.config.OnChange(key, results)
+		}
 	}
 
 	r.cache.Set(key, results, r.config.CacheTTL)
