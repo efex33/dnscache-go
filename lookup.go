@@ -186,7 +186,10 @@ func (r *Resolver) lookupAndCache(ctx context.Context, key string, fetcher func(
 	if r.config.OnChange != nil {
 		oldIPs, _, _ := r.cache.Get(key)
 		if oldIPs == nil || ipListChanged(oldIPs, results) {
-			go r.config.OnChange(key, results)
+			// Pass a copy to avoid data race with cache storage
+			ipsCopy := make([]string, len(results))
+			copy(ipsCopy, results)
+			go r.config.OnChange(key, ipsCopy)
 		}
 	}
 
