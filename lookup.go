@@ -150,8 +150,16 @@ func (r *Resolver) lookupAndCache(ctx context.Context, key string, fetcher func(
 	results, err := fetcher(ctx, key)
 
 	if trace != nil && trace.DNSDone != nil {
+		var addrs []net.IPAddr
+		if err == nil {
+			for _, s := range results {
+				if ip := net.ParseIP(s); ip != nil {
+					addrs = append(addrs, net.IPAddr{IP: ip})
+				}
+			}
+		}
 		trace.DNSDone(httptrace.DNSDoneInfo{
-			Addrs: make([]net.IPAddr, 0),
+			Addrs: addrs,
 			Err:   err,
 		})
 	}
