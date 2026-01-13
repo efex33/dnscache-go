@@ -1,5 +1,7 @@
 # dnscache-go
 
+[English](README.md) | [中文文档](README_zh.md)
+
 A production-ready DNS cache library for Go that integrates seamlessly with `net/http` and standard library network interfaces.
 
 It is designed to eliminate DNS latency spikes and provide robust connection handling out of the box.
