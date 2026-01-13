@@ -8,7 +8,7 @@ It is designed to eliminate DNS latency spikes and provide robust connection han
 
 While heavily inspired by existing solutions like `rs/dnscache`, this library introduces several key engineering improvements for production environments:
 
-- **Smart Async Refresh**: Unlike traditional caches that expire and block, this library automatically refreshes "hot" domains in the background when their TTL is halfway through. This ensures your application **always hits the cache (0ms latency)** and never waits for DNS resolution during high traffic.
+- **Smart Async Refresh (Opt-in)**: Unlike traditional caches that expire and block, this library can automatically refresh "hot" domains in the background when their TTL is halfway through. Enable `EnableAutoRefresh` to ensure your application **always hits the cache (0ms latency)** and never waits for DNS resolution during high traffic.
 - **Negative Caching**: Automatically caches DNS failures for a short duration (default 1 second). This prevents "cache stampede" on the upstream DNS server during outages while ensuring rapid recovery when the service is restored.
 - **Standard `DialContext` with Failover**: Directly implements the standard `DialContext` interface, making it a true drop-in replacement for `http.Transport`. It also includes built-in connection failover (Happy Eyeballs simplified), automatically retrying the next IP if the first one fails.
 - **Configurable TTL**: Supports explicit Cache TTL configuration. Entries expire deterministically, and a background cleaner (optional) ensures unused entries are removed, preventing memory leaks without relying on manual refresh triggers.
@@ -18,7 +18,7 @@ While heavily inspired by existing solutions like `rs/dnscache`, this library in
 
 - **Drop-in Replacement**: Implements `DialContext` for easy integration with `http.Transport`.
 - **Cache Stampede Protection**: Uses `singleflight` to merge concurrent DNS queries.
-- **Zero Latency**: Async auto-refresh keeps the cache warm for active domains.
+- **Zero Latency**: Async auto-refresh (when enabled) keeps the cache warm for active domains.
 - **High Availability**: Connection failover ensures robustness against single IP failures.
 - **Observability**: Built-in metrics (`CacheHits`/`CacheMisses`), `OnCacheMiss` hook, and `httptrace` support.
 - **Dynamic Updates**: `OnChange` hook allows reacting to IP changes in real-time (e.g., for service discovery).
@@ -151,6 +151,11 @@ config := dnscache.Config{
     // while ensuring quick recovery.
     CacheFailTTL: 1 * time.Second,
 
+    // Enable background refresh for "hot" domains.
+    // When enabled, entries are refreshed at 50% TTL to ensure zero-latency cache hits.
+    // Default is false. If enabled, remember to call resolver.Stop() when done.
+    EnableAutoRefresh: true,
+
     // OnChange is executed when the resolved IPs for a host change.
     // It receives the host name and the new list of IP addresses.
     // This is useful for load balancer updates or service discovery triggers.
@@ -175,7 +180,7 @@ config := dnscache.Config{
 
 resolver := dnscache.New(config)
 
-// If CleanupInterval is set, remember to stop the cleanup goroutine when done
+// If CleanupInterval or EnableAutoRefresh is set, remember to stop the background goroutine when done
 // defer resolver.Stop()
 ```
 
