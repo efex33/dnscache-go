@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"net/http/httptest"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -13,13 +12,7 @@ import (
 )
 
 func TestIntegration(t *testing.T) {
-	// 1. Setup a dummy HTTP server
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintln(w, "Hello, client")
-	}))
-	defer ts.Close()
-
-	// 2. Create our Resolver
+	// 1. Create our Resolver
 	r := New(Config{Disabled: false})
 
 	// 3. Create HTTP client using our Resolver
