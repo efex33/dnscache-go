@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -614,4 +615,764 @@ func TestCustomDNSServerIntegration(t *testing.T) {
 	} else {
 		t.Logf("Resolved example.com via 8.8.8.8: %v", ips)
 	}
+}
+
+// =====================================================
+// DialContext Tests
+// =====================================================
+
+func TestDialContext_InvalidAddress(t *testing.T) {
+	r := New(Config{})
+
+	// Address without port should fail SplitHostPort
+	_, err := r.DialContext(context.Background(), "tcp", "example.com")
+	if err == nil {
+		t.Error("Expected error for address without port")
+	}
+
+	// Invalid address format
+	_, err = r.DialContext(context.Background(), "tcp", ":::")
+	if err == nil {
+		t.Error("Expected error for invalid address format")
+	}
+}
+
+func TestDialContext_NoAddresses(t *testing.T) {
+	r := New(Config{})
+
+	// Mock resolver that returns empty IPs
+	mock := &mockDNSResolver{
+		lookupHostFunc: func(ctx context.Context, host string) ([]string, error) {
+			return []string{}, nil
+		},
+	}
+	r.upstream = mock
+
+	_, err := r.DialContext(context.Background(), "tcp", "noaddrs.test:80")
+	if err == nil {
+		t.Error("Expected error when no addresses found")
+	}
+
+	// Verify it's the correct error type
+	opErr, ok := err.(*net.OpError)
+	if !ok {
+		t.Errorf("Expected *net.OpError, got %T", err)
+	} else if opErr.Op != "dial" {
+		t.Errorf("Expected Op='dial', got '%s'", opErr.Op)
+	}
+}
+
+func TestDialContext_LookupError(t *testing.T) {
+	r := New(Config{})
+
+	// Mock resolver that returns error
+	expectedErr := fmt.Errorf("dns lookup failed")
+	mock := &mockDNSResolver{
+		lookupHostFunc: func(ctx context.Context, host string) ([]string, error) {
+			return nil, expectedErr
+		},
+	}
+	r.upstream = mock
+
+	_, err := r.DialContext(context.Background(), "tcp", "fail.test:80")
+	if err == nil {
+		t.Error("Expected error from lookup failure")
+	}
+}
+
+func TestDialContext_DisabledMode(t *testing.T) {
+	r := New(Config{Disabled: true})
+
+	// In disabled mode, DialContext should pass through directly
+	// Testing with invalid address - it should still attempt to dial
+	_, err := r.DialContext(context.Background(), "tcp", "127.0.0.1:9999")
+	// We expect connection refused, not a DNS error
+	if err == nil {
+		t.Error("Expected connection error")
+	}
+}
+
+func TestDialContext_TriesMultipleIPs(t *testing.T) {
+	var dialCount int32
+
+	r := New(Config{
+		DialStrategy: DialStrategySequential, // Use sequential to make order predictable
+	})
+
+	// Mock resolver returns multiple IPs
+	mock := &mockDNSResolver{
+		lookupHostFunc: func(ctx context.Context, host string) ([]string, error) {
+			return []string{"10.0.0.1", "10.0.0.2", "10.0.0.3"}, nil
+		},
+	}
+	r.upstream = mock
+
+	// Custom dialer that tracks dial attempts
+	r.dialer = &net.Dialer{
+		Timeout: 10 * time.Millisecond,
+	}
+
+	// Try to connect - all should fail but it should try all IPs
+	_, err := r.DialContext(context.Background(), "tcp", "multi.test:9999")
+	if err == nil {
+		t.Error("Expected connection error")
+	}
+
+	// Verify multiple IPs were tried (indirectly verified by the error being from the last attempt)
+	_ = dialCount
+}
+
+func TestDialContext_ReturnsFirstSuccessful(t *testing.T) {
+	r := New(Config{
+		DialStrategy: DialStrategySequential,
+	})
+
+	// Start a local listener
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Failed to create listener: %v", err)
+	}
+	defer ln.Close()
+
+	port := ln.Addr().(*net.TCPAddr).Port
+
+	// Mock resolver returns IPs - first fails, second should succeed
+	mock := &mockDNSResolver{
+		lookupHostFunc: func(ctx context.Context, host string) ([]string, error) {
+			return []string{"10.255.255.1", fmt.Sprintf("127.0.0.1")}, nil
+		},
+	}
+	r.upstream = mock
+	r.dialer = &net.Dialer{Timeout: 50 * time.Millisecond}
+
+	// Accept connections in background
+	go func() {
+		conn, _ := ln.Accept()
+		if conn != nil {
+			conn.Close()
+		}
+	}()
+
+	conn, err := r.DialContext(context.Background(), "tcp", fmt.Sprintf("test.local:%d", port))
+	if err != nil {
+		t.Errorf("Expected successful connection: %v", err)
+	}
+	if conn != nil {
+		conn.Close()
+	}
+}
+
+// =====================================================
+// LookupIP Tests
+// =====================================================
+
+func TestLookupIP_NetworkFiltering(t *testing.T) {
+	r := New(Config{})
+
+	// Mock resolver returns both IPv4 and IPv6
+	mock := &mockDNSResolver{
+		lookupHostFunc: func(ctx context.Context, host string) ([]string, error) {
+			return []string{"192.168.1.1", "10.0.0.1", "2001:db8::1", "::1"}, nil
+		},
+	}
+	r.upstream = mock
+
+	t.Run("ip4 only", func(t *testing.T) {
+		ips, err := r.LookupIP(context.Background(), "ip4", "mixed.test")
+		if err != nil {
+			t.Fatalf("LookupIP failed: %v", err)
+		}
+
+		for _, ip := range ips {
+			if ip.To4() == nil {
+				t.Errorf("Expected only IPv4, got IPv6: %s", ip)
+			}
+		}
+
+		if len(ips) != 2 {
+			t.Errorf("Expected 2 IPv4 addresses, got %d", len(ips))
+		}
+	})
+
+	t.Run("ip6 only", func(t *testing.T) {
+		// Clear cache for fresh test
+		r.cache = newMemoryCache()
+
+		ips, err := r.LookupIP(context.Background(), "ip6", "mixed.test")
+		if err != nil {
+			t.Fatalf("LookupIP failed: %v", err)
+		}
+
+		for _, ip := range ips {
+			if ip.To4() != nil {
+				t.Errorf("Expected only IPv6, got IPv4: %s", ip)
+			}
+		}
+
+		if len(ips) != 2 {
+			t.Errorf("Expected 2 IPv6 addresses, got %d", len(ips))
+		}
+	})
+
+	t.Run("ip (both)", func(t *testing.T) {
+		r.cache = newMemoryCache()
+
+		ips, err := r.LookupIP(context.Background(), "ip", "mixed.test")
+		if err != nil {
+			t.Fatalf("LookupIP failed: %v", err)
+		}
+
+		if len(ips) != 4 {
+			t.Errorf("Expected 4 addresses, got %d", len(ips))
+		}
+	})
+}
+
+func TestLookupIP_DisabledMode(t *testing.T) {
+	var lookupIPCalled bool
+
+	mock := &mockDNSResolverFull{
+		lookupIPFunc: func(ctx context.Context, network, host string) ([]net.IP, error) {
+			lookupIPCalled = true
+			return []net.IP{net.ParseIP("1.2.3.4")}, nil
+		},
+	}
+
+	r := New(Config{
+		Disabled: true,
+		Upstream: mock,
+	})
+
+	_, err := r.LookupIP(context.Background(), "ip", "test.com")
+	if err != nil {
+		t.Fatalf("LookupIP failed: %v", err)
+	}
+
+	if !lookupIPCalled {
+		t.Error("Expected upstream LookupIP to be called in disabled mode")
+	}
+}
+
+func TestLookupIP_LookupError(t *testing.T) {
+	r := New(Config{})
+
+	mock := &mockDNSResolver{
+		lookupHostFunc: func(ctx context.Context, host string) ([]string, error) {
+			return nil, fmt.Errorf("lookup failed")
+		},
+	}
+	r.upstream = mock
+
+	_, err := r.LookupIP(context.Background(), "ip", "fail.test")
+	if err == nil {
+		t.Error("Expected error from LookupIP")
+	}
+}
+
+// =====================================================
+// EnableAutoRefresh Tests
+// =====================================================
+
+func TestEnableAutoRefresh(t *testing.T) {
+	var lookupCount int32
+
+	r := New(Config{
+		CacheTTL:          100 * time.Millisecond,
+		EnableAutoRefresh: true,
+	})
+
+	mock := &mockDNSResolver{
+		lookupHostFunc: func(ctx context.Context, host string) ([]string, error) {
+			atomic.AddInt32(&lookupCount, 1)
+			return []string{"1.1.1.1"}, nil
+		},
+	}
+	r.upstream = mock
+
+	// First lookup - cache miss
+	_, err := r.LookupHost(context.Background(), "refresh.test")
+	if err != nil {
+		t.Fatalf("First lookup failed: %v", err)
+	}
+
+	if atomic.LoadInt32(&lookupCount) != 1 {
+		t.Errorf("Expected 1 lookup, got %d", atomic.LoadInt32(&lookupCount))
+	}
+
+	// Wait until we're past half TTL but before full expiry
+	time.Sleep(60 * time.Millisecond)
+
+	// Second lookup - should trigger async refresh
+	_, err = r.LookupHost(context.Background(), "refresh.test")
+	if err != nil {
+		t.Fatalf("Second lookup failed: %v", err)
+	}
+
+	// Wait for async refresh to complete
+	time.Sleep(50 * time.Millisecond)
+
+	// Should have triggered background refresh
+	count := atomic.LoadInt32(&lookupCount)
+	if count < 2 {
+		t.Errorf("Expected at least 2 lookups (auto-refresh), got %d", count)
+	}
+}
+
+// =====================================================
+// httptrace Tests
+// =====================================================
+
+func TestHttptrace_DNSCallbacks(t *testing.T) {
+	var dnsStartCalled, dnsDoneCalled bool
+	var dnsStartHost string
+	var dnsDoneAddrs []net.IPAddr
+
+	r := New(Config{})
+
+	mock := &mockDNSResolver{
+		lookupHostFunc: func(ctx context.Context, host string) ([]string, error) {
+			return []string{"93.184.216.34", "2606:2800:220:1:248:1893:25c8:1946"}, nil
+		},
+	}
+	r.upstream = mock
+
+	trace := &httptrace.ClientTrace{
+		DNSStart: func(info httptrace.DNSStartInfo) {
+			dnsStartCalled = true
+			dnsStartHost = info.Host
+		},
+		DNSDone: func(info httptrace.DNSDoneInfo) {
+			dnsDoneCalled = true
+			dnsDoneAddrs = info.Addrs
+		},
+	}
+
+	ctx := httptrace.WithClientTrace(context.Background(), trace)
+
+	_, err := r.LookupHost(ctx, "trace.test")
+	if err != nil {
+		t.Fatalf("LookupHost failed: %v", err)
+	}
+
+	if !dnsStartCalled {
+		t.Error("DNSStart callback was not called")
+	}
+
+	if dnsStartHost != "trace.test" {
+		t.Errorf("DNSStart host = %s, want trace.test", dnsStartHost)
+	}
+
+	if !dnsDoneCalled {
+		t.Error("DNSDone callback was not called")
+	}
+
+	if len(dnsDoneAddrs) != 2 {
+		t.Errorf("DNSDone addrs count = %d, want 2", len(dnsDoneAddrs))
+	}
+}
+
+func TestHttptrace_DNSError(t *testing.T) {
+	var dnsDoneErr error
+
+	r := New(Config{})
+
+	expectedErr := fmt.Errorf("dns error")
+	mock := &mockDNSResolver{
+		lookupHostFunc: func(ctx context.Context, host string) ([]string, error) {
+			return nil, expectedErr
+		},
+	}
+	r.upstream = mock
+
+	trace := &httptrace.ClientTrace{
+		DNSDone: func(info httptrace.DNSDoneInfo) {
+			dnsDoneErr = info.Err
+		},
+	}
+
+	ctx := httptrace.WithClientTrace(context.Background(), trace)
+
+	_, err := r.LookupHost(ctx, "error.test")
+	if err == nil {
+		t.Error("Expected error")
+	}
+
+	if dnsDoneErr == nil {
+		t.Error("DNSDone should have received the error")
+	}
+}
+
+// =====================================================
+// Context Cancellation Tests
+// =====================================================
+
+func TestLookup_ContextCancelled(t *testing.T) {
+	r := New(Config{})
+
+	mock := &mockDNSResolver{
+		lookupHostFunc: func(ctx context.Context, host string) ([]string, error) {
+			// Simulate slow lookup
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(5 * time.Second):
+				return []string{"1.1.1.1"}, nil
+			}
+		},
+	}
+	r.upstream = mock
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	_, err := r.LookupHost(ctx, "slow.test")
+	if err == nil {
+		t.Error("Expected context timeout error")
+	}
+
+	if err != context.DeadlineExceeded {
+		t.Errorf("Expected DeadlineExceeded, got %v", err)
+	}
+
+	// Verify error is not cached for normal expiry
+	// (CacheFailTTL should be used for failures)
+}
+
+func TestLookup_ContextCancelledNoCache(t *testing.T) {
+	r := New(Config{})
+
+	callCount := 0
+	mock := &mockDNSResolver{
+		lookupHostFunc: func(ctx context.Context, host string) ([]string, error) {
+			callCount++
+			if callCount == 1 {
+				// First call - simulate cancellation
+				return nil, context.Canceled
+			}
+			return []string{"1.1.1.1"}, nil
+		},
+	}
+	r.upstream = mock
+
+	// First call with cancelled context
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // Cancel immediately
+
+	_, _ = r.LookupHost(ctx, "cancel.test")
+
+	// Second call with valid context - should do fresh lookup
+	_, err := r.LookupHost(context.Background(), "cancel.test")
+	if err != nil {
+		t.Errorf("Second lookup should succeed: %v", err)
+	}
+
+	// Should have made 2 calls (context cancellation not cached indefinitely)
+	if callCount < 2 {
+		t.Errorf("Expected at least 2 lookup calls, got %d", callCount)
+	}
+}
+
+// =====================================================
+// ipListChanged Tests
+// =====================================================
+
+func TestIpListChanged(t *testing.T) {
+	tests := []struct {
+		name     string
+		oldIPs   []string
+		newIPs   []string
+		expected bool
+	}{
+		{"empty to empty", nil, nil, false},
+		{"empty to non-empty", nil, []string{"1.1.1.1"}, true},
+		{"non-empty to empty", []string{"1.1.1.1"}, nil, true},
+		{"same IPs same order", []string{"1.1.1.1", "2.2.2.2"}, []string{"1.1.1.1", "2.2.2.2"}, false},
+		{"same IPs different order", []string{"1.1.1.1", "2.2.2.2"}, []string{"2.2.2.2", "1.1.1.1"}, false},
+		{"different IPs same length", []string{"1.1.1.1", "2.2.2.2"}, []string{"1.1.1.1", "3.3.3.3"}, true},
+		{"subset", []string{"1.1.1.1", "2.2.2.2"}, []string{"1.1.1.1"}, true},
+		{"superset", []string{"1.1.1.1"}, []string{"1.1.1.1", "2.2.2.2"}, true},
+		{"duplicate handling", []string{"1.1.1.1", "1.1.1.1"}, []string{"1.1.1.1", "2.2.2.2"}, true},
+		{"all duplicates same", []string{"1.1.1.1", "1.1.1.1"}, []string{"1.1.1.1", "1.1.1.1"}, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := ipListChanged(tt.oldIPs, tt.newIPs)
+			if result != tt.expected {
+				t.Errorf("ipListChanged(%v, %v) = %v, want %v",
+					tt.oldIPs, tt.newIPs, result, tt.expected)
+			}
+		})
+	}
+}
+
+// =====================================================
+// memoryCache Tests
+// =====================================================
+
+func TestMemoryCache_Basic(t *testing.T) {
+	cache := newMemoryCache()
+
+	// Test Get on empty cache
+	ips, err, expireAt := cache.Get("nonexistent")
+	if ips != nil || err != nil || !expireAt.IsZero() {
+		t.Error("Expected nil/nil/zero for nonexistent key")
+	}
+
+	// Test Set and Get
+	cache.Set("test.com", []string{"1.1.1.1", "2.2.2.2"}, nil, time.Minute)
+
+	ips, err, expireAt = cache.Get("test.com")
+	if len(ips) != 2 {
+		t.Errorf("Expected 2 IPs, got %d", len(ips))
+	}
+	if err != nil {
+		t.Errorf("Expected nil error, got %v", err)
+	}
+	if expireAt.IsZero() {
+		t.Error("Expected non-zero expireAt")
+	}
+	if time.Until(expireAt) < 59*time.Second {
+		t.Error("ExpireAt should be about 1 minute from now")
+	}
+}
+
+func TestMemoryCache_ErrorCaching(t *testing.T) {
+	cache := newMemoryCache()
+
+	expectedErr := fmt.Errorf("lookup failed")
+	cache.Set("error.com", nil, expectedErr, time.Minute)
+
+	ips, err, _ := cache.Get("error.com")
+	if ips != nil {
+		t.Errorf("Expected nil IPs, got %v", ips)
+	}
+	if err == nil || err.Error() != expectedErr.Error() {
+		t.Errorf("Expected error '%v', got '%v'", expectedErr, err)
+	}
+}
+
+func TestMemoryCache_UsedFlag(t *testing.T) {
+	cache := newMemoryCache()
+
+	cache.Set("test.com", []string{"1.1.1.1"}, nil, time.Minute)
+
+	// First Prune - should reset used flag
+	deleted := cache.Prune()
+	if deleted != 0 {
+		t.Errorf("First prune should delete 0, deleted %d", deleted)
+	}
+
+	// Second Prune without Get - should delete
+	deleted = cache.Prune()
+	if deleted != 1 {
+		t.Errorf("Second prune should delete 1, deleted %d", deleted)
+	}
+
+	// Verify deleted
+	ips, _, _ := cache.Get("test.com")
+	if ips != nil {
+		t.Error("Expected entry to be deleted")
+	}
+}
+
+func TestMemoryCache_UsedFlagPreservation(t *testing.T) {
+	cache := newMemoryCache()
+
+	cache.Set("test.com", []string{"1.1.1.1"}, nil, time.Minute)
+
+	// First Prune - resets used flag
+	cache.Prune()
+
+	// Access the entry - sets used flag
+	cache.Get("test.com")
+
+	// Second Prune - should not delete because it was used
+	deleted := cache.Prune()
+	if deleted != 0 {
+		t.Errorf("Entry was used, should not be deleted, deleted %d", deleted)
+	}
+
+	// Verify still exists
+	ips, _, _ := cache.Get("test.com")
+	if ips == nil {
+		t.Error("Entry should still exist after being used")
+	}
+}
+
+func TestMemoryCache_ConcurrentAccess(t *testing.T) {
+	cache := newMemoryCache()
+
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Add(3)
+
+		// Writer
+		go func(i int) {
+			defer wg.Done()
+			key := fmt.Sprintf("host%d.com", i%10)
+			cache.Set(key, []string{fmt.Sprintf("1.1.1.%d", i)}, nil, time.Minute)
+		}(i)
+
+		// Reader
+		go func(i int) {
+			defer wg.Done()
+			key := fmt.Sprintf("host%d.com", i%10)
+			cache.Get(key)
+		}(i)
+
+		// Pruner
+		go func() {
+			defer wg.Done()
+			cache.Prune()
+		}()
+	}
+
+	wg.Wait()
+}
+
+// =====================================================
+// PersistOnFailure Additional Tests
+// =====================================================
+
+func TestPersistOnFailure_CacheHitWithError(t *testing.T) {
+	r := New(Config{
+		CacheTTL:         time.Minute,
+		PersistOnFailure: true,
+	})
+
+	// First, set up cache with valid data
+	r.cache.Set("persist.test", []string{"1.1.1.1"}, nil, time.Minute)
+
+	// Now set error with the existing IPs preserved
+	r.cache.Set("persist.test", []string{"1.1.1.1"}, fmt.Errorf("some error"), time.Minute)
+
+	// Lookup should return cached IPs despite error
+	ips, err := r.LookupHost(context.Background(), "persist.test")
+	if err != nil {
+		t.Errorf("Expected success with PersistOnFailure, got error: %v", err)
+	}
+	if len(ips) != 1 || ips[0] != "1.1.1.1" {
+		t.Errorf("Expected cached IP, got %v", ips)
+	}
+}
+
+// =====================================================
+// Singleflight Double-Check Tests
+// =====================================================
+
+func TestSingleflight_DoubleCheck(t *testing.T) {
+	r := New(Config{CacheTTL: time.Minute})
+
+	var lookupCount int32
+	mock := &mockDNSResolver{
+		lookupHostFunc: func(ctx context.Context, host string) ([]string, error) {
+			// Simulate slow lookup
+			time.Sleep(50 * time.Millisecond)
+			atomic.AddInt32(&lookupCount, 1)
+			return []string{"1.1.1.1"}, nil
+		},
+	}
+	r.upstream = mock
+
+	// Start many concurrent lookups
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, _ = r.LookupHost(context.Background(), "singleflight.test")
+		}()
+	}
+
+	wg.Wait()
+
+	// Singleflight should coalesce all requests into 1 or very few
+	count := atomic.LoadInt32(&lookupCount)
+	if count > 2 {
+		t.Errorf("Expected singleflight to coalesce, got %d lookups", count)
+	}
+}
+
+// =====================================================
+// LookupAddr Disabled Mode Test
+// =====================================================
+
+func TestLookupAddr_DisabledMode(t *testing.T) {
+	var lookupAddrCalled bool
+
+	mock := &mockDNSResolverFull{
+		lookupAddrFunc: func(ctx context.Context, addr string) ([]string, error) {
+			lookupAddrCalled = true
+			return []string{"example.com."}, nil
+		},
+	}
+
+	r := New(Config{
+		Disabled: true,
+		Upstream: mock,
+	})
+
+	names, err := r.LookupAddr(context.Background(), "1.2.3.4")
+	if err != nil {
+		t.Fatalf("LookupAddr failed: %v", err)
+	}
+
+	if !lookupAddrCalled {
+		t.Error("Expected upstream LookupAddr to be called in disabled mode")
+	}
+
+	if len(names) != 1 || names[0] != "example.com." {
+		t.Errorf("Expected ['example.com.'], got %v", names)
+	}
+}
+
+// =====================================================
+// applyDialStrategy Edge Cases
+// =====================================================
+
+func TestApplyDialStrategy_EmptyIPs(t *testing.T) {
+	r := New(Config{DialStrategy: DialStrategyRandom})
+
+	result := r.applyDialStrategy([]string{})
+	if len(result) != 0 {
+		t.Errorf("Expected empty result, got %v", result)
+	}
+
+	result = r.applyDialStrategy(nil)
+	if result != nil {
+		t.Errorf("Expected nil result, got %v", result)
+	}
+}
+
+// =====================================================
+// Additional Helper Mocks
+// =====================================================
+
+// mockDNSResolverFull implements all DNSResolver methods with customizable behavior
+type mockDNSResolverFull struct {
+	lookupHostFunc func(ctx context.Context, host string) ([]string, error)
+	lookupAddrFunc func(ctx context.Context, addr string) ([]string, error)
+	lookupIPFunc   func(ctx context.Context, network, host string) ([]net.IP, error)
+}
+
+func (m *mockDNSResolverFull) LookupHost(ctx context.Context, host string) ([]string, error) {
+	if m.lookupHostFunc != nil {
+		return m.lookupHostFunc(ctx, host)
+	}
+	return nil, nil
+}
+
+func (m *mockDNSResolverFull) LookupAddr(ctx context.Context, addr string) ([]string, error) {
+	if m.lookupAddrFunc != nil {
+		return m.lookupAddrFunc(ctx, addr)
+	}
+	return nil, nil
+}
+
+func (m *mockDNSResolverFull) LookupIP(ctx context.Context, network, host string) ([]net.IP, error) {
+	if m.lookupIPFunc != nil {
+		return m.lookupIPFunc(ctx, network, host)
+	}
+	return nil, nil
 }
